@@ -6,6 +6,8 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from core.config import settings
+from core.db import async_session
+from core.models import Message as DiaryMessage
 
 router = Router()
 
@@ -20,7 +22,18 @@ async def handle_start(message: Message) -> None:
 
 @router.message(F.text)
 async def handle_echo(message: Message) -> None:
-    await message.answer(message.text)
+    word_count = len(message.text.split())
+    async with async_session() as session:
+        session.add(
+            DiaryMessage(
+                user_id=message.from_user.id,
+                text=message.text,
+                word_count=word_count,
+            )
+        )
+        await session.commit()
+
+    await message.answer(f"Сохранил ({word_count} слов).")
 
 
 async def main() -> None:
