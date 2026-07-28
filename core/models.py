@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import BigInteger, DateTime, Integer, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -16,3 +16,11 @@ class Message(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class UsageDaily(Base):
+    __tablename__ = "usage_daily"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    words_used: Mapped[int] = mapped_column(Integer, server_default="0")
