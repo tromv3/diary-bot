@@ -8,7 +8,9 @@ from aiogram.types import Message
 from core.config import settings
 from core.constants import DAILY_WORD_LIMIT
 from core.db import async_session
+from core.llm import extract_theses
 from core.models import Message as DiaryMessage
+from core.models import Thesis
 from core.quota import try_reserve_words
 
 router = Router()
@@ -35,16 +37,34 @@ async def handle_echo(message: Message) -> None:
             )
             return
 
-        session.add(
-            DiaryMessage(
-                user_id=message.from_user.id,
-                text=message.text,
-                word_count=word_count,
-            )
+        diary_message = DiaryMessage(
+            user_id=message.from_user.id,
+            text=message.text,
+            word_count=word_count,
         )
+        session.add(diary_message)
         await session.commit()
 
-    await message.answer(f"Сохранил ({word_count} слов).")
+    theses: list[str] = []
+    try:
+        # Broad on purpose: an OpenRouter/network hiccup must not lose the message
+        # that's already saved, or crash the bot for one user's request.
+        theses = await extract_theses(message.text)
+    except Exception:
+        logging.exception("Failed to extract theses for message %s", diary_message.id)
+
+    if theses:
+        async with async_session() as session:
+            session.add_all(
+                Thesis(message_id=diary_message.id, user_id=message.from_user.id, text=t)
+                for t in theses
+            )
+            await session.commit()
+
+    reply = f"Сохранил ({word_count} слов)."
+    if theses:
+        reply += "\n\nТезисы:\n" + "\n".join(f"- {t}" for t in theses)
+    await message.answer(reply)
 
 
 async def main() -> None:

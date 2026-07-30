@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import BigInteger, Date, DateTime, Integer, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -13,6 +13,18 @@ class Message(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     text: Mapped[str] = mapped_column(Text)
     word_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Thesis(Base):
+    __tablename__ = "theses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
