@@ -3,6 +3,7 @@ import datetime
 from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
+from core.constants import SOURCE_TEXT
 from core.db import Base
 
 
@@ -13,6 +14,8 @@ class Message(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     text: Mapped[str] = mapped_column(Text)
     word_count: Mapped[int] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(Text, server_default=SOURCE_TEXT)
+    audio_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

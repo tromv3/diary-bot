@@ -1,1 +1,4 @@
 DAILY_WORD_LIMIT = 1500
+
+SOURCE_TEXT = "text"
+SOURCE_VOICE = "voice"

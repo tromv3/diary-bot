@@ -5,17 +5,21 @@ import logging
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+from arq import create_pool
+from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy import func, select
 
 from core.config import settings
 from core.constants import DAILY_WORD_LIMIT
 from core.db import async_session
 from core.llm import extract_theses, summarize_theses
+from core.media import voice_path
 from core.models import Message as DiaryMessage
 from core.models import Thesis, UsageDaily
 from core.quota import try_reserve_words
 
 router = Router()
+redis_pool: ArqRedis | None = None
 
 
 @router.message(CommandStart())
@@ -68,6 +72,18 @@ async def handle_report(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
+@router.message(F.voice)
+async def handle_voice(message: Message) -> None:
+    voice = message.voice
+    path = voice_path(message.from_user.id, voice.file_unique_id)
+    await message.bot.download(voice, destination=path)
+
+    await redis_pool.enqueue_job(
+        "transcribe_voice", str(path), message.from_user.id, message.chat.id
+    )
+    await message.answer("Принял голосовое, распознаю...")
+
+
 @router.message(F.text)
 async def handle_echo(message: Message) -> None:
     word_count = len(message.text.split())
@@ -112,7 +128,9 @@ async def handle_echo(message: Message) -> None:
 
 
 async def main() -> None:
+    global redis_pool
     logging.basicConfig(level=logging.INFO)
+    redis_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
     dp.include_router(router)
