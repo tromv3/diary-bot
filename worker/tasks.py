@@ -12,7 +12,7 @@ from core.db import async_session
 from core.llm import extract_theses
 from core.models import Message as DiaryMessage
 from core.models import Thesis
-from core.quota import try_reserve_words
+from core.quota import quota_exceeded_message, try_reserve_words
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,10 @@ async def transcribe_voice(
             await session.commit()
             await bot.send_message(
                 chat_id,
-                f"Распознал голосовое ({word_count} слов), но дневной лимит "
-                f"{DAILY_WORD_LIMIT} слов уже исчерпан — сообщение не сохранено. "
-                "Напишите администратору, чтобы увеличить лимит.",
+                quota_exceeded_message(
+                    f"Распознал голосовое ({word_count} слов), но дневной лимит "
+                    f"{DAILY_WORD_LIMIT} слов уже исчерпан — сообщение не сохранено."
+                ),
             )
             return
 

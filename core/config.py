@@ -15,6 +15,8 @@ class Settings:
     redis_url: str
     media_root: str
     whisper_model_size: str
+    admin_ids: frozenset[int]
+    admin_contact: str | None
 
 
 def _load_settings() -> Settings:
@@ -55,6 +57,12 @@ def _load_settings() -> Settings:
     media_root = os.environ.get("MEDIA_ROOT", "media")
     whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "large-v3")
 
+    admin_ids_raw = os.environ.get("ADMIN_IDS", "")
+    admin_ids = frozenset(
+        int(part) for part in admin_ids_raw.split(",") if part.strip()
+    )
+    admin_contact = os.environ.get("ADMIN_CONTACT") or None
+
     return Settings(
         bot_token=token,
         database_url=database_url,
@@ -63,6 +71,8 @@ def _load_settings() -> Settings:
         redis_url=redis_url,
         media_root=media_root,
         whisper_model_size=whisper_model_size,
+        admin_ids=admin_ids,
+        admin_contact=admin_contact,
     )
 
 

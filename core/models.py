@@ -39,3 +39,10 @@ class UsageDaily(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
     words_used: Mapped[int] = mapped_column(Integer, server_default="0")
+
+
+class UserCredit(Base):
+    __tablename__ = "user_credits"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    bonus_words: Mapped[int] = mapped_column(Integer, server_default="0")
