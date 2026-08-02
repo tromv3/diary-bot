@@ -10,7 +10,7 @@ from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy import func, select
 
 from core.config import settings
-from core.constants import DAILY_WORD_LIMIT
+from core.constants import DAILY_WORD_LIMIT, REPORT_PERIOD_DAYS
 from core.db import async_session
 from core.llm import extract_theses, summarize_theses
 from core.media import voice_path
@@ -31,19 +31,36 @@ async def handle_start(message: Message) -> None:
 
 
 @router.message(Command("report"))
-async def handle_report(message: Message) -> None:
+async def handle_report(message: Message, command: CommandObject) -> None:
+    period = (command.args or "day").strip().lower()
+    if period not in REPORT_PERIOD_DAYS:
+        await message.answer("Использование: /report [day|week|month]")
+        return
+
     user_id = message.from_user.id
     today = datetime.date.today()
+    start_date = today - datetime.timedelta(days=REPORT_PERIOD_DAYS[period] - 1)
+    range_end = today + datetime.timedelta(days=1)  # exclusive, start of tomorrow
 
     async with async_session() as session:
         theses = (
             await session.execute(
                 select(Thesis)
-                .where(Thesis.user_id == user_id, func.date(Thesis.created_at) == today)
+                .where(
+                    Thesis.user_id == user_id,
+                    Thesis.created_at >= start_date,
+                    Thesis.created_at < range_end,
+                )
                 .order_by(Thesis.created_at)
             )
         ).scalars().all()
-        usage = await session.get(UsageDaily, (user_id, today))
+        words_used = await session.scalar(
+            select(func.coalesce(func.sum(UsageDaily.words_used), 0)).where(
+                UsageDaily.user_id == user_id,
+                UsageDaily.date >= start_date,
+                UsageDaily.date <= today,
+            )
+        )
 
     thesis_texts = [t.text for t in theses]
     summary = thesis_texts
@@ -54,17 +71,19 @@ async def handle_report(message: Message) -> None:
             summary = await summarize_theses(thesis_texts)
         except Exception:
             logging.exception(
-                "Failed to summarize theses for report user=%s date=%s", user_id, today
+                "Failed to summarize theses for report user=%s period=%s", user_id, period
             )
 
-    words_used = usage.words_used if usage else 0
-    lines = [
-        f"Отчёт за {today.isoformat()}",
-        f"Слов написано: {words_used} из {DAILY_WORD_LIMIT}",
-        "",
-    ]
+    if period == "day":
+        period_label = today.isoformat()
+        words_line = f"Слов написано: {words_used} из {DAILY_WORD_LIMIT}"
+    else:
+        period_label = f"{start_date.isoformat()} — {today.isoformat()}"
+        words_line = f"Слов написано: {words_used}"
+
+    lines = [f"Отчёт за {period_label}", words_line, ""]
     if summary:
-        lines.append("Тезисы дня:")
+        lines.append("Тезисы:")
         lines.extend(f"- {t}" for t in summary)
     else:
         lines.append("Тезисов пока нет.")
