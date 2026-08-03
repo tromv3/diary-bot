@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 from typing import Any
 
@@ -12,6 +13,7 @@ from core.db import async_session
 from core.llm import extract_theses
 from core.models import Message as DiaryMessage
 from core.models import Thesis
+from core.photos import link_pending_photos
 from core.quota import quota_exceeded_message, try_reserve_words
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,11 @@ def _transcribe_sync(model: WhisperModel, audio_path: str) -> str:
 
 
 async def transcribe_voice(
-    ctx: dict[str, Any], audio_path: str, user_id: int, chat_id: int
+    ctx: dict[str, Any],
+    audio_path: str,
+    user_id: int,
+    chat_id: int,
+    photo_batch_since: str | None = None,
 ) -> None:
     bot: Bot = ctx["bot"]
     model: WhisperModel = ctx["whisper_model"]
@@ -57,6 +63,13 @@ async def transcribe_voice(
         session.add(diary_message)
         await session.commit()
 
+        linked_photos = 0
+        if photo_batch_since is not None:
+            linked_photos = await link_pending_photos(
+                session, user_id, datetime.datetime.fromisoformat(photo_batch_since), diary_message.id
+            )
+            await session.commit()
+
     theses: list[str] = []
     try:
         # Same reasoning as in the bot's text handler: an extraction failure
@@ -72,7 +85,9 @@ async def transcribe_voice(
             )
             await session.commit()
 
-    reply = f"Распознал голосовое ({word_count} слов):\n\n{text}"
+    reply = f"Распознал голосовое ({word_count} слов"
+    reply += f", фото: {linked_photos})" if linked_photos else ")"
+    reply += f":\n\n{text}"
     if theses:
         reply += "\n\nТезисы:\n" + "\n".join(f"- {t}" for t in theses)
     await bot.send_message(chat_id, reply)
