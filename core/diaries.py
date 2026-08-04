@@ -7,7 +7,12 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.constants import CATEGORY_GENERAL, DEFAULT_DIARY_NAME, NEW_DIARY_BUTTON_LABEL
+from core.constants import (
+    CATEGORY_GENERAL,
+    DEFAULT_DIARY_NAME,
+    NEW_DIARY_BUTTON_LABEL,
+    REPORT_BUTTON_LABEL,
+)
 from core.db import async_session
 from core.models import Diary, UserSettings
 
@@ -63,6 +68,19 @@ async def set_active_diary(session: AsyncSession, user_id: int, diary_id: int) -
     )
 
 
+async def get_pinned_message_id(session: AsyncSession, user_id: int) -> int | None:
+    settings_row = await session.get(UserSettings, user_id)
+    return settings_row.pinned_message_id if settings_row else None
+
+
+async def set_pinned_message_id(session: AsyncSession, user_id: int, message_id: int) -> None:
+    await session.execute(
+        update(UserSettings)
+        .where(UserSettings.user_id == user_id)
+        .values(pinned_message_id=message_id)
+    )
+
+
 async def create_diary(session: AsyncSession, user_id: int, name: str) -> Diary:
     diary = Diary(user_id=user_id, name=name, category=CATEGORY_GENERAL)
     session.add(diary)
@@ -73,7 +91,9 @@ async def create_diary(session: AsyncSession, user_id: int, name: str) -> Diary:
 
 def build_diary_keyboard(diaries: list[Diary]) -> ReplyKeyboardMarkup:
     rows = [[KeyboardButton(text=diary.name)] for diary in diaries]
-    rows.append([KeyboardButton(text=NEW_DIARY_BUTTON_LABEL)])
+    rows.append(
+        [KeyboardButton(text=NEW_DIARY_BUTTON_LABEL), KeyboardButton(text=REPORT_BUTTON_LABEL)]
+    )
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 

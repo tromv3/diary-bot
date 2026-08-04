@@ -24,6 +24,7 @@ class UserSettings(Base):
 
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     active_diary_id: Mapped[int] = mapped_column(ForeignKey("diaries.id"))
+    pinned_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Message(Base):

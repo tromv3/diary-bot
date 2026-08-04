@@ -15,7 +15,7 @@ from core.models import Diary
 from core.models import Message as DiaryMessage
 from core.models import Thesis
 from core.photos import link_pending_photos
-from core.quota import quota_exceeded_message, try_reserve_words
+from core.quota import build_request_words_keyboard, quota_exceeded_message, try_reserve_words
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ async def transcribe_voice(
                     f"Распознал голосовое ({word_count} слов), но дневной лимит "
                     f"{DAILY_WORD_LIMIT} слов уже исчерпан — сообщение не сохранено."
                 ),
+                reply_markup=build_request_words_keyboard(),
             )
             return
 

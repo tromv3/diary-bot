@@ -3,10 +3,11 @@ import datetime
 import logging
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.redis import RedisStorage
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy import func, select
@@ -16,7 +17,9 @@ from core.constants import (
     DAILY_WORD_LIMIT,
     NEW_DIARY_BUTTON_LABEL,
     PHOTO_STORY_DEBOUNCE_SECONDS,
+    REPORT_BUTTON_LABEL,
     REPORT_PERIOD_DAYS,
+    REPORT_PERIOD_LABELS,
 )
 from core.db import async_session
 from core.diaries import (
@@ -25,8 +28,10 @@ from core.diaries import (
     build_diary_keyboard,
     create_diary,
     ensure_active_diary,
+    get_pinned_message_id,
     list_diaries,
     set_active_diary,
+    set_pinned_message_id,
 )
 from core.llm import extract_theses, summarize_theses
 from core.media import photo_path, voice_path
@@ -34,7 +39,13 @@ from core.models import Diary
 from core.models import Message as DiaryMessage
 from core.models import Photo, Thesis, UsageDaily
 from core.photos import PhotoStory, link_pending_photos, peek_pending_photo_batch
-from core.quota import grant_bonus_words, quota_exceeded_message, try_reserve_words
+from core.quota import (
+    REQUEST_WORDS_CALLBACK,
+    build_request_words_keyboard,
+    grant_bonus_words,
+    quota_exceeded_message,
+    try_reserve_words,
+)
 
 router = Router()
 redis_pool: ArqRedis | None = None
@@ -46,19 +57,56 @@ redis_pool: ArqRedis | None = None
 # acceptable edge case for a single-instance personal bot.
 _photo_batches: dict[int, tuple[datetime.datetime, asyncio.Task, str | None, int]] = {}
 
+# In-memory only, same trade-off as _photo_batches: caps one admin notification
+# per user per day when they tap "request more words" repeatedly after hitting
+# the daily limit, without needing a DB column for something this disposable.
+_word_request_dates: dict[int, datetime.date] = {}
+
+
+async def _pin_active_diary(bot: Bot, chat_id: int, user_id: int, diary_name: str) -> None:
+    """(Re-)pin a status message announcing the active diary.
+
+    Sends a fresh message rather than editing the old one in place — Telegram
+    private chats let a bot pin without admin rights, and always sending a new
+    message sidesteps having to special-case "message is not modified" errors.
+    The previous pin (if any) is unpinned; failures there are swallowed since
+    it may already be gone (deleted/unpinned by the user).
+    """
+    async with async_session() as session:
+        old_pinned_id = await get_pinned_message_id(session, user_id)
+
+    sent = await bot.send_message(chat_id, f"📌 Активный дневник: {diary_name}")
+    try:
+        await bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)
+    except TelegramBadRequest:
+        logging.exception("Failed to pin active-diary message for user=%s", user_id)
+
+    if old_pinned_id is not None:
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=old_pinned_id)
+        except TelegramBadRequest:
+            pass
+
+    async with async_session() as session:
+        await set_pinned_message_id(session, user_id, sent.message_id)
+        await session.commit()
+
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
     async with async_session() as session:
-        await ensure_active_diary(session, message.from_user.id)
+        diary = await ensure_active_diary(session, message.from_user.id)
         await session.commit()
         diaries = await list_diaries(session, message.from_user.id)
+        pinned_id = await get_pinned_message_id(session, message.from_user.id)
 
     await message.answer(
         "Привет! Я бот-дневник. Пишешь мне текстом, голосом или фото — "
         "я сохраняю и выделяю тезисы. Дневник для записи выбирается кнопками внизу.",
         reply_markup=build_diary_keyboard(diaries),
     )
+    if pinned_id is None:
+        await _pin_active_diary(message.bot, message.chat.id, message.from_user.id, diary.name)
 
 
 @router.message(DiaryCreation.waiting_name)
@@ -69,7 +117,7 @@ async def handle_new_diary_name(message: Message, state: FSMContext) -> None:
         return
 
     async with async_session() as session:
-        await create_diary(session, message.from_user.id, name)
+        diary = await create_diary(session, message.from_user.id, name)
         await session.commit()
         diaries = await list_diaries(session, message.from_user.id)
 
@@ -77,6 +125,7 @@ async def handle_new_diary_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"Дневник «{name}» создан и выбран.", reply_markup=build_diary_keyboard(diaries)
     )
+    await _pin_active_diary(message.bot, message.chat.id, message.from_user.id, diary.name)
 
 
 @router.message(F.text == NEW_DIARY_BUTTON_LABEL)
@@ -95,16 +144,21 @@ async def handle_diary_switch(message: Message, matched_diary: Diary) -> None:
     await message.answer(
         f"Дневник переключён: {matched_diary.name}", reply_markup=build_diary_keyboard(diaries)
     )
+    await _pin_active_diary(message.bot, message.chat.id, message.from_user.id, matched_diary.name)
 
 
-@router.message(Command("report"))
-async def handle_report(message: Message, command: CommandObject) -> None:
-    period = (command.args or "day").strip().lower()
-    if period not in REPORT_PERIOD_DAYS:
-        await message.answer("Использование: /report [day|week|month]")
-        return
+def _report_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=label, callback_data=f"report:{period}")
+                for period, label in REPORT_PERIOD_LABELS.items()
+            ]
+        ]
+    )
 
-    user_id = message.from_user.id
+
+async def _generate_report(user_id: int, period: str) -> str:
     today = datetime.date.today()
     start_date = today - datetime.timedelta(days=REPORT_PERIOD_DAYS[period] - 1)
     range_end = today + datetime.timedelta(days=1)  # exclusive, start of tomorrow
@@ -157,7 +211,62 @@ async def handle_report(message: Message, command: CommandObject) -> None:
     else:
         lines.append("Тезисов пока нет.")
 
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
+
+
+@router.message(Command("report"))
+async def handle_report(message: Message, command: CommandObject) -> None:
+    period = (command.args or "day").strip().lower()
+    if period not in REPORT_PERIOD_DAYS:
+        await message.answer("Использование: /report [day|week|month]")
+        return
+
+    progress = await message.answer("Готовлю отчёт...")
+    text = await _generate_report(message.from_user.id, period)
+    await progress.edit_text(text)
+
+
+@router.message(F.text == REPORT_BUTTON_LABEL)
+async def handle_report_button(message: Message) -> None:
+    await message.answer("За какой период?", reply_markup=_report_period_keyboard())
+
+
+@router.callback_query(F.data.startswith("report:"))
+async def handle_report_period_callback(callback: CallbackQuery) -> None:
+    period = callback.data.split(":", 1)[1]
+    # Ack the tap and swap in a placeholder immediately — summarize_theses is an
+    # LLM call and can take a few seconds, during which the button would otherwise
+    # look unresponsive with no feedback that anything happened.
+    await callback.answer()
+    if callback.message is not None:
+        await callback.message.edit_text("Готовлю отчёт...", reply_markup=None)
+    text = await _generate_report(callback.from_user.id, period)
+    if callback.message is not None:
+        await callback.message.edit_text(text)
+
+
+@router.callback_query(F.data == REQUEST_WORDS_CALLBACK)
+async def handle_request_words(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    today = datetime.date.today()
+    if _word_request_dates.get(user.id) == today:
+        await callback.answer(
+            "Запрос уже отправлен сегодня, дождитесь ответа администратора.", show_alert=True
+        )
+        return
+
+    _word_request_dates[user.id] = today
+    who = f"@{user.username}" if user.username else user.full_name
+    notice = f"{who} (id {user.id}) запросил больше слов.\n/grant {user.id} <кол-во>"
+    for admin_id in settings.admin_ids:
+        try:
+            await callback.bot.send_message(admin_id, notice)
+        except Exception:
+            logging.exception("Failed to notify admin %s about word request from %s", admin_id, user.id)
+
+    if callback.message is not None:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Запрос отправлен администратору.")
 
 
 @router.message(Command("grant"))
@@ -204,7 +313,9 @@ async def _save_diary_entry(
         if not allowed:
             await session.commit()
             await bot.send_message(
-                chat_id, quota_exceeded_message(f"Дневной лимит {DAILY_WORD_LIMIT} слов исчерпан.")
+                chat_id,
+                quota_exceeded_message(f"Дневной лимит {DAILY_WORD_LIMIT} слов исчерпан."),
+                reply_markup=build_request_words_keyboard(),
             )
             return None
 

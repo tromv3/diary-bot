@@ -1,5 +1,6 @@
 import datetime
 
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.constants import DAILY_WORD_LIMIT
 from core.models import UsageDaily, UserCredit
+
+REQUEST_WORDS_CALLBACK = "request_words"
 
 
 async def try_reserve_words(session: AsyncSession, user_id: int, word_count: int) -> bool:
@@ -72,6 +75,14 @@ async def grant_bonus_words(session: AsyncSession, user_id: int, words: int) -> 
 
 
 def quota_exceeded_message(prefix: str) -> str:
+    text = f"{prefix} Нажмите кнопку ниже, чтобы запросить больше слов у администратора"
     if settings.admin_contact:
-        return f"{prefix} Напишите {settings.admin_contact}, чтобы докупить слов."
-    return f"{prefix} Напишите администратору, чтобы докупить слов."
+        text += f", либо напишите {settings.admin_contact} напрямую"
+    return text + "."
+
+
+def build_request_words_keyboard() -> InlineKeyboardMarkup:
+    button = InlineKeyboardButton(
+        text="Запросить больше слов", callback_data=REQUEST_WORDS_CALLBACK
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
