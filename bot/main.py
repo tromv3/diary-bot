@@ -12,10 +12,25 @@ from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy import func, select
 
 from core.config import settings
-from core.constants import DAILY_WORD_LIMIT, PHOTO_STORY_DEBOUNCE_SECONDS, REPORT_PERIOD_DAYS
+from core.constants import (
+    DAILY_WORD_LIMIT,
+    NEW_DIARY_BUTTON_LABEL,
+    PHOTO_STORY_DEBOUNCE_SECONDS,
+    REPORT_PERIOD_DAYS,
+)
 from core.db import async_session
+from core.diaries import (
+    DiaryButtonFilter,
+    DiaryCreation,
+    build_diary_keyboard,
+    create_diary,
+    ensure_active_diary,
+    list_diaries,
+    set_active_diary,
+)
 from core.llm import extract_theses, summarize_theses
 from core.media import photo_path, voice_path
+from core.models import Diary
 from core.models import Message as DiaryMessage
 from core.models import Photo, Thesis, UsageDaily
 from core.photos import PhotoStory, link_pending_photos, peek_pending_photo_batch
@@ -26,16 +41,59 @@ redis_pool: ArqRedis | None = None
 
 # In-memory only: which user has a debounce task pending after their most recent
 # photo(s), when the current batch started (for the eventual `since` filter in
-# link_pending_photos), and the first caption seen in the batch, if any. Lost on
-# restart, which is an acceptable edge case for a single-instance personal bot.
-_photo_batches: dict[int, tuple[datetime.datetime, asyncio.Task, str | None]] = {}
+# link_pending_photos), the first caption seen in the batch (if any), and the
+# diary that was active when the batch started. Lost on restart, which is an
+# acceptable edge case for a single-instance personal bot.
+_photo_batches: dict[int, tuple[datetime.datetime, asyncio.Task, str | None, int]] = {}
 
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
+    async with async_session() as session:
+        await ensure_active_diary(session, message.from_user.id)
+        await session.commit()
+        diaries = await list_diaries(session, message.from_user.id)
+
     await message.answer(
-        "Привет! Я бот-дневник. Пока что я просто повторяю за тобой — "
-        "скоро научусь сохранять и анализировать твои мысли."
+        "Привет! Я бот-дневник. Пишешь мне текстом, голосом или фото — "
+        "я сохраняю и выделяю тезисы. Дневник для записи выбирается кнопками внизу.",
+        reply_markup=build_diary_keyboard(diaries),
+    )
+
+
+@router.message(DiaryCreation.waiting_name)
+async def handle_new_diary_name(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if not name or name == NEW_DIARY_BUTTON_LABEL:
+        await message.answer("Название не может быть пустым. Напиши название дневника:")
+        return
+
+    async with async_session() as session:
+        await create_diary(session, message.from_user.id, name)
+        await session.commit()
+        diaries = await list_diaries(session, message.from_user.id)
+
+    await state.clear()
+    await message.answer(
+        f"Дневник «{name}» создан и выбран.", reply_markup=build_diary_keyboard(diaries)
+    )
+
+
+@router.message(F.text == NEW_DIARY_BUTTON_LABEL)
+async def handle_new_diary_button(message: Message, state: FSMContext) -> None:
+    await state.set_state(DiaryCreation.waiting_name)
+    await message.answer("Как назвать новый дневник?")
+
+
+@router.message(F.text, DiaryButtonFilter())
+async def handle_diary_switch(message: Message, matched_diary: Diary) -> None:
+    async with async_session() as session:
+        await set_active_diary(session, message.from_user.id, matched_diary.id)
+        await session.commit()
+        diaries = await list_diaries(session, message.from_user.id)
+
+    await message.answer(
+        f"Дневник переключён: {matched_diary.name}", reply_markup=build_diary_keyboard(diaries)
     )
 
 
@@ -52,11 +110,13 @@ async def handle_report(message: Message, command: CommandObject) -> None:
     range_end = today + datetime.timedelta(days=1)  # exclusive, start of tomorrow
 
     async with async_session() as session:
+        diary = await ensure_active_diary(session, user_id)
+        await session.commit()
         theses = (
             await session.execute(
                 select(Thesis)
                 .where(
-                    Thesis.user_id == user_id,
+                    Thesis.diary_id == diary.id,
                     Thesis.created_at >= start_date,
                     Thesis.created_at < range_end,
                 )
@@ -90,7 +150,7 @@ async def handle_report(message: Message, command: CommandObject) -> None:
         period_label = f"{start_date.isoformat()} — {today.isoformat()}"
         words_line = f"Слов написано: {words_used}"
 
-    lines = [f"Отчёт за {period_label}", words_line, ""]
+    lines = [f"Отчёт «{diary.name}» за {period_label}", words_line, ""]
     if summary:
         lines.append("Тезисы:")
         lines.extend(f"- {t}" for t in summary)
@@ -130,6 +190,7 @@ async def _save_diary_entry(
     chat_id: int,
     bot: Bot,
     text: str,
+    diary_id: int,
     linked_since: datetime.datetime | None,
 ) -> DiaryMessage | None:
     """Reserve quota, persist the message (+ any pending photos, + theses), reply.
@@ -147,14 +208,17 @@ async def _save_diary_entry(
             )
             return None
 
-        diary_message = DiaryMessage(user_id=user_id, text=text, word_count=word_count)
+        diary = await session.get(Diary, diary_id)
+        diary_message = DiaryMessage(
+            user_id=user_id, diary_id=diary_id, text=text, word_count=word_count
+        )
         session.add(diary_message)
         await session.commit()
 
         linked_photos = 0
         if linked_since is not None:
             linked_photos = await link_pending_photos(
-                session, user_id, linked_since, diary_message.id
+                session, user_id, diary_id, linked_since, diary_message.id
             )
             await session.commit()
 
@@ -169,11 +233,12 @@ async def _save_diary_entry(
     if theses:
         async with async_session() as session:
             session.add_all(
-                Thesis(message_id=diary_message.id, user_id=user_id, text=t) for t in theses
+                Thesis(message_id=diary_message.id, user_id=user_id, diary_id=diary_id, text=t)
+                for t in theses
             )
             await session.commit()
 
-    reply = f"Сохранил ({word_count} слов"
+    reply = f"[{diary.name}] Сохранил ({word_count} слов"
     reply += f", фото: {linked_photos})." if linked_photos else ")."
     if theses:
         reply += "\n\nТезисы:\n" + "\n".join(f"- {t}" for t in theses)
@@ -185,18 +250,18 @@ async def _resolve_photo_batch(
     user_id: int, chat_id: int, bot: Bot, state: FSMContext
 ) -> None:
     await asyncio.sleep(PHOTO_STORY_DEBOUNCE_SECONDS)
-    batch_start, _, caption = _photo_batches.pop(user_id, (None, None, None))
+    batch_start, _, caption, diary_id = _photo_batches.pop(user_id, (None, None, None, None))
     if batch_start is None:
         return
 
     if caption:
         # A caption already tells the story — save it right away instead of
         # asking, and skip the FSM wait entirely.
-        await _save_diary_entry(user_id, chat_id, bot, caption, batch_start)
+        await _save_diary_entry(user_id, chat_id, bot, caption, diary_id, batch_start)
         return
 
     await state.set_state(PhotoStory.waiting)
-    await state.update_data(batch_start=batch_start.isoformat())
+    await state.update_data(batch_start=batch_start.isoformat(), diary_id=diary_id)
     await bot.send_message(chat_id, "Расскажи, что здесь происходит?")
 
 
@@ -211,21 +276,26 @@ async def handle_photo(message: Message, state: FSMContext) -> None:
     path = photo_path(user_id, photo.file_unique_id)
     await message.bot.download(photo, destination=path)
 
-    async with async_session() as session:
-        session.add(
-            Photo(user_id=user_id, media_group_id=message.media_group_id, file_path=str(path))
-        )
-        await session.commit()
-
-    if await state.get_state() == PhotoStory.waiting.state:
-        # Already asked (this batch or an earlier one is still pending an answer) —
-        # this photo will be picked up by the `created_at >= batch_start` filter
+    pending_story = await peek_pending_photo_batch(state)
+    if pending_story is not None:
+        # A question is already pending for an earlier (or this) batch — this
+        # photo joins it via the same diary + the `created_at >= since` filter
         # once the story arrives, no need to ask again.
+        async with async_session() as session:
+            session.add(
+                Photo(
+                    user_id=user_id,
+                    diary_id=pending_story.diary_id,
+                    media_group_id=message.media_group_id,
+                    file_path=str(path),
+                )
+            )
+            await session.commit()
         return
 
     pending = _photo_batches.get(user_id)
     if pending is not None:
-        batch_start, task, caption = pending
+        batch_start, task, caption, diary_id = pending
         task.cancel()
         # Only the first caption seen in the batch counts (Telegram albums put
         # the caption on a single photo anyway).
@@ -233,32 +303,56 @@ async def handle_photo(message: Message, state: FSMContext) -> None:
     else:
         batch_start = received_at
         caption = message.caption
+        async with async_session() as session:
+            diary = await ensure_active_diary(session, user_id)
+            await session.commit()
+            diary_id = diary.id
+
+    async with async_session() as session:
+        session.add(
+            Photo(
+                user_id=user_id,
+                diary_id=diary_id,
+                media_group_id=message.media_group_id,
+                file_path=str(path),
+            )
+        )
+        await session.commit()
 
     task = asyncio.create_task(
         _resolve_photo_batch(user_id, message.chat.id, message.bot, state)
     )
-    _photo_batches[user_id] = (batch_start, task, caption)
+    _photo_batches[user_id] = (batch_start, task, caption, diary_id)
 
 
 @router.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
     voice = message.voice
-    path = voice_path(message.from_user.id, voice.file_unique_id)
+    path = voice_path(user_id, voice.file_unique_id)
     await message.bot.download(voice, destination=path)
 
-    since = await peek_pending_photo_batch(state)
-    if since is not None:
+    pending = await peek_pending_photo_batch(state)
+    if pending is not None:
+        diary_id, since = pending.diary_id, pending.since
         # Can't cheaply defer consuming this until the worker actually saves the
         # message (different process) — accept the small edge case where a
         # failed transcription/quota check in the worker leaves the photos
         # unlinked, same as the general "no story" fallback.
         await state.clear()
+    else:
+        async with async_session() as session:
+            diary = await ensure_active_diary(session, user_id)
+            await session.commit()
+            diary_id = diary.id
+        since = None
 
     await redis_pool.enqueue_job(
         "transcribe_voice",
         str(path),
-        message.from_user.id,
+        user_id,
         message.chat.id,
+        diary_id,
         since.isoformat() if since else None,
     )
     await message.answer("Принял голосовое, распознаю...")
@@ -267,14 +361,22 @@ async def handle_voice(message: Message, state: FSMContext) -> None:
 @router.message(F.text)
 async def handle_echo(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
-    since = await peek_pending_photo_batch(state)
+    pending = await peek_pending_photo_batch(state)
+    if pending is not None:
+        diary_id, since = pending.diary_id, pending.since
+    else:
+        async with async_session() as session:
+            diary = await ensure_active_diary(session, user_id)
+            await session.commit()
+            diary_id = diary.id
+        since = None
 
     diary_message = await _save_diary_entry(
-        user_id, message.chat.id, message.bot, message.text, since
+        user_id, message.chat.id, message.bot, message.text, diary_id, since
     )
     # Only consume the pending-photo state once the story actually saved —
     # a quota rejection shouldn't burn the user's answer window.
-    if diary_message is not None and since is not None:
+    if diary_message is not None and pending is not None:
         await state.clear()
 
 

@@ -11,6 +11,7 @@ from core.config import settings
 from core.constants import DAILY_WORD_LIMIT, SOURCE_VOICE
 from core.db import async_session
 from core.llm import extract_theses
+from core.models import Diary
 from core.models import Message as DiaryMessage
 from core.models import Thesis
 from core.photos import link_pending_photos
@@ -29,6 +30,7 @@ async def transcribe_voice(
     audio_path: str,
     user_id: int,
     chat_id: int,
+    diary_id: int,
     photo_batch_since: str | None = None,
 ) -> None:
     bot: Bot = ctx["bot"]
@@ -53,8 +55,10 @@ async def transcribe_voice(
             )
             return
 
+        diary = await session.get(Diary, diary_id)
         diary_message = DiaryMessage(
             user_id=user_id,
+            diary_id=diary_id,
             text=text,
             word_count=word_count,
             source=SOURCE_VOICE,
@@ -66,7 +70,11 @@ async def transcribe_voice(
         linked_photos = 0
         if photo_batch_since is not None:
             linked_photos = await link_pending_photos(
-                session, user_id, datetime.datetime.fromisoformat(photo_batch_since), diary_message.id
+                session,
+                user_id,
+                diary_id,
+                datetime.datetime.fromisoformat(photo_batch_since),
+                diary_message.id,
             )
             await session.commit()
 
@@ -81,11 +89,12 @@ async def transcribe_voice(
     if theses:
         async with async_session() as session:
             session.add_all(
-                Thesis(message_id=diary_message.id, user_id=user_id, text=t) for t in theses
+                Thesis(message_id=diary_message.id, user_id=user_id, diary_id=diary_id, text=t)
+                for t in theses
             )
             await session.commit()
 
-    reply = f"Распознал голосовое ({word_count} слов"
+    reply = f"[{diary.name}] Распознал голосовое ({word_count} слов"
     reply += f", фото: {linked_photos})" if linked_photos else ")"
     reply += f":\n\n{text}"
     if theses:

@@ -3,8 +3,27 @@ import datetime
 from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from core.constants import SOURCE_TEXT
+from core.constants import CATEGORY_GENERAL, SOURCE_TEXT
 from core.db import Base
+
+
+class Diary(Base):
+    __tablename__ = "diaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    name: Mapped[str] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(Text, server_default=CATEGORY_GENERAL)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    active_diary_id: Mapped[int] = mapped_column(ForeignKey("diaries.id"))
 
 
 class Message(Base):
@@ -12,6 +31,7 @@ class Message(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    diary_id: Mapped[int] = mapped_column(ForeignKey("diaries.id"), index=True)
     text: Mapped[str] = mapped_column(Text)
     word_count: Mapped[int] = mapped_column(Integer)
     source: Mapped[str] = mapped_column(Text, server_default=SOURCE_TEXT)
@@ -27,6 +47,7 @@ class Thesis(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), index=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    diary_id: Mapped[int] = mapped_column(ForeignKey("diaries.id"), index=True)
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -46,6 +67,7 @@ class Photo(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    diary_id: Mapped[int] = mapped_column(ForeignKey("diaries.id"), index=True)
     media_group_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str] = mapped_column(Text)
     message_id: Mapped[int | None] = mapped_column(
