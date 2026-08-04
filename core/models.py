@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.constants import CATEGORY_GENERAL, SOURCE_TEXT
@@ -25,6 +25,15 @@ class UserSettings(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     active_diary_id: Mapped[int] = mapped_column(ForeignKey("diaries.id"))
     pinned_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    questions_enabled: Mapped[bool] = mapped_column(Boolean, server_default="true")
+
+
+class QuestionAskLog(Base):
+    __tablename__ = "question_ask_log"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    question_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    last_asked_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Message(Base):

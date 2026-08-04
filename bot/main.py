@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from arq import create_pool
@@ -14,12 +15,18 @@ from sqlalchemy import func, select
 
 from core.config import settings
 from core.constants import (
+    ANSWER_TYPE_NUMBER,
     DAILY_WORD_LIMIT,
     NEW_DIARY_BUTTON_LABEL,
     PHOTO_STORY_DEBOUNCE_SECONDS,
+    QUESTIONS_POLL_INTERVAL_SECONDS,
+    QUESTIONS_TIME,
     REPORT_BUTTON_LABEL,
     REPORT_PERIOD_DAYS,
     REPORT_PERIOD_LABELS,
+    SOURCE_TEXT,
+    SOURCE_VOICE,
+    VOICE_JOB_TIMEOUT_SECONDS,
 )
 from core.db import async_session
 from core.diaries import (
@@ -37,7 +44,7 @@ from core.llm import extract_theses, summarize_theses
 from core.media import photo_path, voice_path
 from core.models import Diary
 from core.models import Message as DiaryMessage
-from core.models import Photo, Thesis, UsageDaily
+from core.models import Photo, Thesis, UsageDaily, UserSettings
 from core.photos import PhotoStory, link_pending_photos, peek_pending_photo_batch
 from core.quota import (
     REQUEST_WORDS_CALLBACK,
@@ -46,9 +53,21 @@ from core.quota import (
     quota_exceeded_message,
     try_reserve_words,
 )
+from core.questions import (
+    PendingQuestion,
+    QuestionFlow,
+    get_due_questions,
+    get_questions_enabled,
+    mark_question_asked,
+    parse_number,
+    peek_pending_question,
+    set_questions_enabled,
+)
+from core.voice import VoiceConfirm, peek_pending_voice_confirm
 
 router = Router()
 redis_pool: ArqRedis | None = None
+fsm_storage: RedisStorage | None = None
 
 # In-memory only: which user has a debounce task pending after their most recent
 # photo(s), when the current batch started (for the eventual `since` filter in
@@ -294,6 +313,21 @@ async def handle_grant(message: Message, command: CommandObject) -> None:
     )
 
 
+@router.message(Command("questions"))
+async def handle_questions_toggle(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip().lower()
+    async with async_session() as session:
+        await ensure_active_diary(session, message.from_user.id)  # guarantees a settings row exists
+        await session.commit()
+        if arg in ("on", "off"):
+            await set_questions_enabled(session, message.from_user.id, arg == "on")
+            await session.commit()
+        enabled = await get_questions_enabled(session, message.from_user.id)
+
+    status = "включены" if enabled else "выключены"
+    await message.answer(f"Проактивные вопросы сейчас {status}.\nИспользование: /questions on|off")
+
+
 async def _save_diary_entry(
     user_id: int,
     chat_id: int,
@@ -301,6 +335,8 @@ async def _save_diary_entry(
     text: str,
     diary_id: int,
     linked_since: datetime.datetime | None,
+    source: str = SOURCE_TEXT,
+    audio_path: str | None = None,
 ) -> DiaryMessage | None:
     """Reserve quota, persist the message (+ any pending photos, + theses), reply.
 
@@ -321,7 +357,12 @@ async def _save_diary_entry(
 
         diary = await session.get(Diary, diary_id)
         diary_message = DiaryMessage(
-            user_id=user_id, diary_id=diary_id, text=text, word_count=word_count
+            user_id=user_id,
+            diary_id=diary_id,
+            text=text,
+            word_count=word_count,
+            source=source,
+            audio_path=audio_path,
         )
         session.add(diary_message)
         await session.commit()
@@ -355,6 +396,219 @@ async def _save_diary_entry(
         reply += "\n\nТезисы:\n" + "\n".join(f"- {t}" for t in theses)
     await bot.send_message(chat_id, reply)
     return diary_message
+
+
+def _fsm_context(bot_id: int, user_id: int) -> FSMContext:
+    """Build an FSMContext outside of any incoming update.
+
+    Needed by the question scheduler (no update to hand a context over) and by
+    the voice-transcript background task (running detached from the handler
+    that spawned it). Assumes chat_id == user_id, true for this private-chat
+    personal bot — the same assumption the scheduler already makes.
+    """
+    assert fsm_storage is not None
+    return FSMContext(storage=fsm_storage, key=StorageKey(bot_id=bot_id, chat_id=user_id, user_id=user_id))
+
+
+def _voice_confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Верно", callback_data=f"{prefix}:yes"),
+                InlineKeyboardButton(text="✏️ Исправить", callback_data=f"{prefix}:no"),
+            ]
+        ]
+    )
+
+
+async def _send_next_question(
+    bot: Bot, user_id: int, chat_id: int, state: FSMContext, diary_id: int, queue: list[dict]
+) -> None:
+    question = queue[0]
+    async with async_session() as session:
+        await mark_question_asked(session, user_id, question["key"])
+        await session.commit()
+
+    await state.set_state(QuestionFlow.waiting)
+    await state.update_data(
+        queue=queue,
+        diary_id=diary_id,
+        asked_at=datetime.datetime.now().isoformat(),
+        pending_voice_text=None,
+    )
+    await bot.send_message(chat_id, question["text"])
+
+
+async def _accept_question_answer(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    state: FSMContext,
+    pending: PendingQuestion,
+    raw_text: str,
+) -> None:
+    raw_text = raw_text.strip()
+    if pending.answer_type == ANSWER_TYPE_NUMBER and parse_number(raw_text) is None:
+        await state.update_data(pending_voice_text=None, asked_at=datetime.datetime.now().isoformat())
+        await bot.send_message(
+            chat_id, f"Не понял число, пришли, пожалуйста, просто число.\n{pending.text}"
+        )
+        return  # validation retry — does not advance the queue, is not a timeout/skip
+    if not raw_text:
+        await state.update_data(pending_voice_text=None, asked_at=datetime.datetime.now().isoformat())
+        await bot.send_message(chat_id, f"Пустой ответ не принимается.\n{pending.text}")
+        return
+
+    text = f"{pending.text} {raw_text}"
+    diary_message = await _save_diary_entry(user_id, chat_id, bot, text, pending.diary_id, None)
+    if diary_message is None:
+        # Quota exceeded — _save_diary_entry already sent that message. Leave the
+        # FSM state as-is so a later reply (e.g. after requesting more words)
+        # retries the same question, same as handle_echo does for photo stories.
+        return
+
+    data = await state.get_data()
+    remaining = data["queue"][1:]
+    if remaining:
+        await _send_next_question(bot, user_id, chat_id, state, pending.diary_id, remaining)
+    else:
+        await state.clear()
+        await bot.send_message(chat_id, "Спасибо! На сегодня вопросы закончились 🙂")
+
+
+async def _await_question_voice_transcript(job, bot: Bot, user_id: int, chat_id: int) -> None:
+    try:
+        text = (await job.result(timeout=VOICE_JOB_TIMEOUT_SECONDS) or "").strip()
+    except Exception:
+        logging.exception("Question-answer transcription failed for user=%s", user_id)
+        await bot.send_message(chat_id, "Не получилось распознать голос, попробуй ещё раз.")
+        return
+    if not text:
+        await bot.send_message(chat_id, "Не удалось распознать речь, попробуй ещё раз текстом или голосом.")
+        return
+
+    state = _fsm_context(bot.id, user_id)
+    pending = await peek_pending_question(state)
+    if pending is None:
+        return  # window already expired or queue moved on meanwhile
+
+    await state.update_data(pending_voice_text=text, asked_at=datetime.datetime.now().isoformat())
+    await bot.send_message(
+        chat_id, f"Понял: «{text}»\nВсё верно?", reply_markup=_voice_confirm_keyboard("qvoice")
+    )
+
+
+async def _await_voice_transcript(
+    job, bot: Bot, user_id: int, chat_id: int, state: FSMContext
+) -> None:
+    try:
+        text = (await job.result(timeout=VOICE_JOB_TIMEOUT_SECONDS) or "").strip()
+    except Exception:
+        logging.exception("Voice transcription failed for user=%s", user_id)
+        await state.clear()
+        await bot.send_message(chat_id, "Не получилось распознать голос, попробуй ещё раз.")
+        return
+    if not text:
+        await state.clear()
+        await bot.send_message(chat_id, "Не удалось распознать речь, попробуй ещё раз текстом или голосом.")
+        return
+
+    pending = await peek_pending_voice_confirm(state)
+    if pending is None:
+        return  # window already expired
+
+    await state.update_data(transcript=text)
+    await bot.send_message(
+        chat_id, f"Понял: «{text}»\nВсё верно?", reply_markup=_voice_confirm_keyboard("vconfirm")
+    )
+
+
+@router.callback_query(F.data.in_({"qvoice:yes", "qvoice:no"}))
+async def handle_question_voice_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    pending = await peek_pending_question(state)
+    if pending is None or pending.pending_voice_text is None:
+        return
+
+    user_id = callback.from_user.id
+    if callback.message is not None:
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+    if callback.data == "qvoice:no":
+        await state.update_data(pending_voice_text=None, asked_at=datetime.datetime.now().isoformat())
+        await callback.bot.send_message(user_id, f"Хорошо, ответь ещё раз:\n{pending.text}")
+        return
+
+    await _accept_question_answer(
+        callback.bot, user_id, user_id, state, pending, pending.pending_voice_text
+    )
+
+
+@router.callback_query(F.data.in_({"vconfirm:yes", "vconfirm:no"}))
+async def handle_voice_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    pending = await peek_pending_voice_confirm(state)
+    if pending is None or pending.transcript is None:
+        return  # still transcribing, or the window already expired — ignore a stray tap
+
+    user_id = callback.from_user.id
+    if callback.message is not None:
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+    if callback.data == "vconfirm:no":
+        await state.clear()
+        await callback.bot.send_message(user_id, "Хорошо, отправь ещё раз текстом или голосом.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    await _save_diary_entry(
+        user_id,
+        user_id,
+        callback.bot,
+        pending.transcript,
+        pending.diary_id,
+        pending.linked_since,
+        source=SOURCE_VOICE,
+        audio_path=data.get("audio_path"),
+    )
+
+
+async def _dispatch_due_questions(bot: Bot) -> None:
+    now = datetime.datetime.now()
+    if now.time() < QUESTIONS_TIME:
+        return
+
+    async with async_session() as session:
+        user_ids = (
+            await session.execute(
+                select(UserSettings.user_id).where(UserSettings.questions_enabled.is_(True))
+            )
+        ).scalars().all()
+
+    for user_id in user_ids:
+        state = _fsm_context(bot.id, user_id)
+        if await state.get_state() is not None:
+            continue  # mid photo-story / diary-creation / already mid question-flow — retry next tick
+
+        async with async_session() as session:
+            due = await get_due_questions(session, user_id, now.date())
+            if not due:
+                continue
+            diary = await ensure_active_diary(session, user_id)
+            await session.commit()
+
+        queue = [{"key": q.key, "text": q.text, "answer_type": q.answer_type} for q in due]
+        await _send_next_question(bot, user_id, user_id, state, diary.id, queue)
+
+
+async def _run_question_scheduler(bot: Bot) -> None:
+    while True:
+        try:
+            await _dispatch_due_questions(bot)
+        except Exception:
+            logging.exception("Question scheduler tick failed")
+        await asyncio.sleep(QUESTIONS_POLL_INTERVAL_SECONDS)
 
 
 async def _resolve_photo_batch(
@@ -443,14 +697,18 @@ async def handle_voice(message: Message, state: FSMContext) -> None:
     path = voice_path(user_id, voice.file_unique_id)
     await message.bot.download(voice, destination=path)
 
+    pending_question = await peek_pending_question(state)
+    if pending_question is not None:
+        job = await redis_pool.enqueue_job("transcribe_audio", str(path))
+        asyncio.create_task(
+            _await_question_voice_transcript(job, message.bot, user_id, message.chat.id)
+        )
+        await message.answer("Секунду, слушаю голосовое...")
+        return
+
     pending = await peek_pending_photo_batch(state)
     if pending is not None:
         diary_id, since = pending.diary_id, pending.since
-        # Can't cheaply defer consuming this until the worker actually saves the
-        # message (different process) — accept the small edge case where a
-        # failed transcription/quota check in the worker leaves the photos
-        # unlinked, same as the general "no story" fallback.
-        await state.clear()
     else:
         async with async_session() as session:
             diary = await ensure_active_diary(session, user_id)
@@ -458,20 +716,35 @@ async def handle_voice(message: Message, state: FSMContext) -> None:
             diary_id = diary.id
         since = None
 
-    await redis_pool.enqueue_job(
-        "transcribe_voice",
-        str(path),
-        user_id,
-        message.chat.id,
-        diary_id,
-        since.isoformat() if since else None,
+    # Claim the FSM slot up front (before transcription finishes) so a second
+    # voice/photo arriving mid-transcription doesn't race into the same pending
+    # photo-story. This also supersedes any pending photo-story state — same
+    # trade-off it already had (can't cheaply defer consuming it across the
+    # async transcription gap), just via a new intermediate state instead of
+    # an immediate state.clear().
+    await state.set_state(VoiceConfirm.waiting)
+    await state.update_data(
+        diary_id=diary_id,
+        linked_since=since.isoformat() if since else None,
+        audio_path=str(path),
+        transcript=None,
+        started_at=datetime.datetime.now().isoformat(),
     )
-    await message.answer("Принял голосовое, распознаю...")
+    job = await redis_pool.enqueue_job("transcribe_audio", str(path))
+    asyncio.create_task(_await_voice_transcript(job, message.bot, user_id, message.chat.id, state))
+    await message.answer("Секунду, слушаю голосовое...")
 
 
 @router.message(F.text)
 async def handle_echo(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
+    pending_question = await peek_pending_question(state)
+    if pending_question is not None:
+        await _accept_question_answer(
+            message.bot, user_id, message.chat.id, state, pending_question, message.text
+        )
+        return
+
     pending = await peek_pending_photo_batch(state)
     if pending is not None:
         diary_id, since = pending.diary_id, pending.since
@@ -492,14 +765,19 @@ async def handle_echo(message: Message, state: FSMContext) -> None:
 
 
 async def main() -> None:
-    global redis_pool
+    global redis_pool, fsm_storage
     logging.basicConfig(level=logging.INFO)
     redis_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     bot = Bot(token=settings.bot_token)
-    storage = RedisStorage.from_url(settings.redis_url)
-    dp = Dispatcher(storage=storage)
+    fsm_storage = RedisStorage.from_url(settings.redis_url)
+    dp = Dispatcher(storage=fsm_storage)
     dp.include_router(router)
-    await dp.start_polling(bot)
+
+    scheduler_task = asyncio.create_task(_run_question_scheduler(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler_task.cancel()
 
 
 if __name__ == "__main__":
