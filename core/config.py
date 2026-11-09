@@ -15,6 +15,8 @@ class Settings:
     redis_url: str
     media_root: str
     whisper_model_size: str
+    whisper_device: str
+    whisper_compute_type: str
     admin_ids: frozenset[int]
     admin_contact: str | None
 
@@ -56,6 +58,8 @@ def _load_settings() -> Settings:
 
     media_root = os.environ.get("MEDIA_ROOT", "media")
     whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "large-v3")
+    whisper_device = os.environ.get("WHISPER_DEVICE", "cuda")
+    whisper_compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "float16")
 
     admin_ids_raw = os.environ.get("ADMIN_IDS", "")
     admin_ids = frozenset(
@@ -71,6 +75,8 @@ def _load_settings() -> Settings:
         redis_url=redis_url,
         media_root=media_root,
         whisper_model_size=whisper_model_size,
+        whisper_device=whisper_device,
+        whisper_compute_type=whisper_compute_type,
         admin_ids=admin_ids,
         admin_contact=admin_contact,
     )

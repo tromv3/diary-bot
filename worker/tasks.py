@@ -30,9 +30,11 @@ async def transcribe_audio(ctx: dict[str, Any], audio_path: str) -> str:
 async def startup(ctx: dict[str, Any]) -> None:
     logging.basicConfig(level=logging.INFO)
     ctx["whisper_model"] = WhisperModel(
-        settings.whisper_model_size, device="cuda", compute_type="float16"
+        settings.whisper_model_size,
+        device=settings.whisper_device,
+        compute_type=settings.whisper_compute_type,
     )
-    logger.info("Worker ready: whisper model '%s' loaded on cuda", settings.whisper_model_size)
+    logger.info("Worker ready: whisper model '%s' loaded on %s", settings.whisper_model_size, settings.whisper_device)
 
 
 class WorkerSettings:
